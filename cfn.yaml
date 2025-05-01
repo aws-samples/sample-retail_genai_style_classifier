@@ -1,0 +1,627 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - bedrock.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                   - s3:AbortMultipartUpload
+                   - s3:DeleteObject
+                   - s3:DeleteObjectVersion
+                   - s3:GetObject
+                   - s3:GetObjectAcl
+                   - s3:GetObjectTagging
+                   - s3:GetObjectVersion
+                   - s3:ListBucket
+                   - s3:ListBucketMultipartUploads
+                   - s3:ListBucketVersions
+                   - s3:ListMultipartUploadParts
+                   - s3:PutObject
+                   - s3:PutObjectAcl
+                   - s3:PutObjectTagging
+                   - s3:PutBucketNotification
+                   - s3:GetBucketNotification
+                   - s3:RestoreObject
+                Resource: 
+                  - !Sub 'arn:aws:s3:::${AWS::AccountId}-style-classifier-artifacts'
+                  - !Sub 'arn:aws:s3:::${AWS::AccountId}-style-classifier-artifacts/*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: 
+                 - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-*'  # For functions in this stack
+              - Effect: Allow
+                Action:
+                  - bedrock:CreateModelInvocationJob
+                  - bedrock:GetModelInvocationJob
+                  - bedrock:ListModelInvocationJobs
+                  - bedrock:InvokeModel
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  - !Sub  'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:model-invocation-job/*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-LambdaExecutionRole-*'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:role:*'
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-LambdaExecutionRole-*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+
+    # S3 Bucket for Product Data
+  ProductInputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-style-classifier-artifacts'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+  
+  ProductInputBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref ProductInputBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - s3:ListBucket
+              - s3:GetObject
+              - s3:PutObject
+            Resource:
+              - !Sub 'arn:aws:s3:::${ProductInputBucket}'
+              - !Sub 'arn:aws:s3:::${ProductInputBucket}/*'
+          - Sid: BedrockAccess
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - s3:ListBucket
+              - s3:GetObject
+              - s3:PutObject
+            Resource:
+              - !Sub 'arn:aws:s3:::${ProductInputBucket}'
+              - !Sub 'arn:aws:s3:::${ProductInputBucket}/*'
+
+  # Lambda Permission for S3 to invoke Lambda1
+  Lambda1Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt Lambda1Function.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 's3.amazonaws.com'
+      SourceArn: !GetAtt ProductInputBucket.Arn
+
+  # Lambda Function to Set S3 Notification (Custom Resource)
+  S3NotificationHelperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-s3-notification-helper'
+      Description: 'Lambda Function to Set S3 Event Notification to trigger ProcessProductDetails lambda'
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      MemorySize: 256
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+          http = urllib3.PoolManager()
+
+          def send_response(event, context, response_status, response_data):
+              response_url = event['ResponseURL']
+              response_body = json.dumps({
+                  'Status': response_status,
+                  'Reason': 'See the details in CloudWatch Log Stream: ' + context.log_stream_name,
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data
+              })
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(response_body))
+              }
+              try:
+                  http.request('PUT', response_url, body=response_body, headers=headers)
+              except Exception as e:
+                  print('send_response failed:', e)
+
+          def handler(event, context):
+              print("Received event:", json.dumps(event))
+              s3 = boto3.client('s3')
+              try:
+                  if event['RequestType'] == 'Delete':
+                      send_response(event, context, 'SUCCESS', {})
+                      return
+
+                  props = event['ResourceProperties']
+                  s3.put_bucket_notification_configuration(
+                      Bucket=props['BucketName'],
+                      NotificationConfiguration=props['NotificationConfiguration']
+                  )
+                  send_response(event, context, 'SUCCESS', {})
+              except Exception as e:
+                  print("Exception occurred:", e)
+                  send_response(event, context, 'FAILED', {})
+
+  # Lambda Function to Process CSV and Start First Bedrock Job (Lambda1)
+  Lambda1Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ProcessProductDetails'
+      Description: 'Parese the products csv file and prepares JSONL file for Pattern Analysis job'
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      MemorySize: 2048
+      Timeout: 900
+      Environment:
+        Variables:
+          BEDROCK_ROLE_ARN: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import csv
+          import base64
+          import logging
+          from botocore.exceptions import ClientError
+          import uuid
+          import os
+
+          # Set up logging
+          logger = logging.getLogger(__name__)
+          logging.basicConfig(level=logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("Received event: %s", json.dumps(event))
+              
+              region = context.invoked_function_arn.split(':')[3]
+              s3 = boto3.client('s3', region_name=region)
+              bedrock = boto3.client(service_name="bedrock", region_name=region)
+              
+              role_arn = os.environ['BEDROCK_ROLE_ARN']
+
+              try:
+                  bucket = event['Records'][0]['s3']['bucket']['name']
+                  key = event['Records'][0]['s3']['object']['key']
+
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  csv_content = response['Body'].read().decode('utf-8')
+                  csv_reader = csv.DictReader(csv_content.splitlines())
+
+                  jsonl_records = []
+                  for row in csv_reader:
+                      try:
+                          # Get image and convert to base64
+                          image_response = s3.get_object(Bucket=bucket, Key=row['image_path'])
+                          image_data = image_response['Body'].read()
+                          image_base64 = base64.b64encode(image_data).decode('utf-8')
+                          logger.info(f"Successfully processed image: {row['image_path']}")
+                      except Exception as e:
+                          logger.error(f"Error processing image {row['image_path']}: {str(e)}")
+                          continue
+
+                      # Create message content
+                      content = [
+                          {
+                              "type": "image",
+                              "source": {
+                                  "type": "base64",
+                                  "media_type": "image/png",
+                                  "data": image_base64
+                              }
+                          },
+                          {
+                              "type": "text",
+                              "text": f"""Analyze this product image and provide:
+                              1. A detailed description focusing on visual aspects
+                              2. Identify any patterns present
+                              3. Provide reasoning for the pattern identification
+                              
+                              Product Context:
+                              Name: {row['productname']}
+                              Description: {row['productdescription']}"""
+                          }
+                      ]
+
+                      # Create record for batch inference
+                      record = {
+                          "recordId": f"PROD_{row['productid']}",
+                          "modelInput": {
+                              "anthropic_version": "bedrock-2023-05-31",
+                              "max_tokens": 1024,
+                              "messages": [
+                                  {
+                                      "role": "user",
+                                      "content": content
+                                  }
+                              ]
+                          }
+                      }
+                      jsonl_records.append(json.dumps(record))
+
+                  if not jsonl_records:
+                      raise ValueError("No records created - check image processing")
+
+                  jsonl_key = f"batch-inference/input/{uuid.uuid4()}.jsonl"
+                  jsonl_content = '\n'.join(jsonl_records)
+                  
+                  logger.info(f"Created {len(jsonl_records)} records")
+                  logger.info(f"Writing JSONL file to: s3://{bucket}/{jsonl_key}")
+                  
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=jsonl_key,
+                      Body=jsonl_content,
+                      ContentType='application/jsonl'
+                  )
+
+                  input_data_config = {
+                      "s3InputDataConfig": {
+                          "s3Uri": f"s3://{bucket}/{jsonl_key}"
+                      }
+                  }
+
+                  output_data_config = {
+                      "s3OutputDataConfig": {
+                          "s3Uri": f"s3://{bucket}/batch-inference/output/"
+                      }
+                  }
+                  job_arn=""
+                  response = bedrock.create_model_invocation_job(
+                      roleArn=role_arn,
+                      modelId="anthropic.claude-3-haiku-20240307-v1:0",
+                      jobName=f"product-analysis-{uuid.uuid4()}",
+                      inputDataConfig=input_data_config,
+                      outputDataConfig=output_data_config
+                  )
+
+                  job_arn = response.get('jobArn')
+                  logger.info(f"Started batch inference job with ARN: {job_arn}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Batch inference job started successfully',
+                          'bucket': bucket,
+                          'input_file': key,
+                          'jsonl_file': jsonl_key,
+                          'job_arn': job_arn,
+                          'record_count': len(jsonl_records)
+                      })
+                  }
+              
+              except ClientError as e:
+                  error_message = f"AWS API Error: {str(e)}"
+                  logger.error(error_message)
+                  raise Exception(error_message)
+              except Exception as e:
+                  error_message = f"Unexpected error: {str(e)}"
+                  logger.error(error_message)
+                  raise Exception(error_message)
+
+  # Lambda Function to Process Second Job After First Bedrock Completion (Lambda2)
+  Lambda2Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-PrepareDataForStyle'
+      Description: 'Prepares JSONL file for Style Analysis job'
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      MemorySize: 2048
+      Timeout: 900
+      Environment:
+        Variables:
+          BEDROCK_ROLE_ARN: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile:  !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def list_files_in_prefix(s3_client, bucket, prefix):
+              """Helper function to list all files in a prefix"""
+              try:
+                  response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+                  return [obj['Key'] for obj in response.get('Contents', [])]
+              except Exception as e:
+                  logger.error(f"Error listing objects in {prefix}: {str(e)}")
+                  return []
+
+          def find_file_by_extension(s3_client, bucket, prefix, extension):
+              """Helper function to find a file with specific extension in a prefix"""
+              files = list_files_in_prefix(s3_client, bucket, prefix)
+              logger.info(f"Files found in {prefix}: {files}")
+              
+              for file_key in files:
+                  if file_key.endswith(extension):
+                      return file_key
+              return None
+
+          def handler(event, context):
+              logger.info("Received event: %s", json.dumps(event))
+              
+              s3 = boto3.client('s3')
+              bedrock = boto3.client(service_name="bedrock", region_name=context.invoked_function_arn.split(':')[3])
+              role_arn = os.environ['BEDROCK_ROLE_ARN']
+
+              # account_id = event['detail']['accountId']
+              job_id = event['detail']['batchJobArn'].split('/')[-1]
+              # bucket = f"styleclassifier-{account_id}-product-input-bucket"
+              bucket =  '${AWS::AccountId}-style-classifier-artifacts'
+              
+              # Find input and output files
+              input_folder = "batch-inference/input/"
+              output_folder = f"batch-inference/output/{job_id}/"
+              
+              logger.info(f"Using bucket: {bucket}")
+              logger.info(f"Job ID: {job_id}")
+              logger.info(f"Looking for input file in: {input_folder}")
+              logger.info(f"Looking for output file in: {output_folder}")
+
+              try:
+                  # List all files in output folder to debug
+                  all_output_files = list_files_in_prefix(s3, bucket, output_folder)
+                  logger.info(f"All files in output folder: {all_output_files}")
+
+                  # Try different output path patterns
+                  output_paths_to_try = [
+                      f"batch-inference/output/{job_id}/",
+                      f"batch-inference/output/",
+                      job_id + "/"
+                  ]
+
+                  output_file = None
+                  for path in output_paths_to_try:
+                      logger.info(f"Trying path: {path}")
+                      output_file = find_file_by_extension(s3, bucket, path, '.jsonl.out')
+                      if output_file:
+                          logger.info(f"Found output file in path {path}: {output_file}")
+                          break
+
+                  if not output_file:
+                      # Try to find any .out file if .jsonl.out is not found
+                      for path in output_paths_to_try:
+                          output_file = find_file_by_extension(s3, bucket, path, '.out')
+                          if output_file:
+                              logger.info(f"Found .out file in path {path}: {output_file}")
+                              break
+
+                  if not output_file:
+                      raise Exception(f"Output file not found in any of these paths: {output_paths_to_try}")
+
+                  # Read the output file
+                  output_response = s3.get_object(Bucket=bucket, Key=output_file)
+                  output_content = output_response['Body'].read().decode('utf-8')
+                  logger.info(f"Successfully read output file: {output_file}")
+
+                  # Find and read input file
+                  input_file = find_file_by_extension(s3, bucket, input_folder, '.jsonl')
+                  if not input_file:
+                      raise Exception("Input file with .jsonl extension not found")
+                  logger.info(f"Found input file: {input_file}")
+
+                  input_response = s3.get_object(Bucket=bucket, Key=input_file)
+                  input_content = input_response['Body'].read().decode('utf-8')
+                  logger.info(f"Successfully read input file: {input_file}")
+
+                  # Process the results and create new JSONL records
+                  jsonl_records = []
+                  for line in output_content.splitlines():
+                      try:
+                          result = json.loads(line)
+                          if 'modelOutput' in result and 'content' in result['modelOutput']:
+                              # Extract just the text content from the first content item
+                              content_text = next(
+                                  (item['text'] for item in result['modelOutput']['content'] 
+                                  if item['type'] == 'text'),
+                                  None
+                              )
+                              
+                              if content_text:
+                                  record_id = result.get('recordId', '')
+                                  product_info = {}  # You'll need to extract this from input_content
+                                  
+                                  style_prompt = f"""Analyze the style of this product based on its details and previous visual analysis.
+
+          Product Information:
+          Name: {product_info.get('name', 'Unknown Product')}
+          Description: {product_info.get('description', 'No description available')}
+
+          Previous Visual Analysis:
+          {content_text}
+
+          Based on the product information and visual analysis, please provide:
+          1. Primary style category
+          2. Secondary style categories (if applicable)
+          3. Detailed reasoning for the style classification
+          4. Key style elements identified
+
+          Format your response as a JSON object with the following structure:
+          {{
+              "primary_style": "string",
+              "secondary_styles": ["string", "string"],
+              "pattern": "string",
+              "reasoning": "string",
+              "key_elements": ["string", "string", "string"]
+          }}
+          """
+
+                                  record = {
+                                      "recordId": record_id,
+                                      "modelInput": {
+                                          "anthropic_version": "bedrock-2023-05-31",
+                                          "max_tokens": 1024,
+                                          "messages": [
+                                              {
+                                                  "role": "user",
+                                                  "content": [
+                                                      {
+                                                          "type": "text",
+                                                          "text": style_prompt
+                                                      }
+                                                  ]
+                                              }
+                                          ]
+                                      }
+                                  }
+                                  jsonl_records.append(json.dumps(record))
+                      except json.JSONDecodeError as e:
+                          logger.error(f"Error parsing JSON: {str(e)}")
+                      except Exception as e:
+                          logger.error(f"Error processing record: {str(e)}")
+
+                  if not jsonl_records:
+                      logger.warning("No valid records found to process")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': 'No valid records found to process',
+                              'record_count': 0
+                          })
+                      }
+
+                  # Create new JSONL file for style analysis
+                  style_analysis_key = f"batch-inference/style-analysis/input/{job_id}_style.jsonl"
+                  jsonl_content = '\n'.join(jsonl_records)
+                  
+                  logger.info(f"Created {len(jsonl_records)} records for style analysis")
+                  
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=style_analysis_key,
+                      Body=jsonl_content,
+                      ContentType='application/jsonl'
+                  )
+
+                  # Start batch inference job
+                  input_data_config = {
+                      "s3InputDataConfig": {
+                          "s3Uri": f"s3://{bucket}/{style_analysis_key}"
+                      }
+                  }
+
+                  output_data_config = {
+                      "s3OutputDataConfig": {
+                          "s3Uri": f"s3://{bucket}/batch-inference/style-analysis/output/"
+                      }
+                  }
+
+                  response = bedrock.create_model_invocation_job(
+                      roleArn=role_arn,
+                      modelId="anthropic.claude-3-haiku-20240307-v1:0",
+                      jobName=f"style-analysis-{job_id}",
+                      inputDataConfig=input_data_config,
+                      outputDataConfig=output_data_config
+                  )
+
+                  job_arn = response.get('jobArn')
+                  logger.info(f"Started style analysis batch job with ARN: {job_arn}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Style analysis batch job started successfully',
+                          'style_analysis_job_arn': job_arn,
+                          'input_file': style_analysis_key,
+                          'record_count': len(jsonl_records)
+                      })
+                  }
+              
+              except ClientError as e:
+                  error_message = f"AWS API Error: {str(e)}"
+                  logger.error(error_message)
+                  raise Exception(error_message)
+              except Exception as e:
+                  error_message = f"Unexpected error: {str(e)}"
+                  logger.error(error_message)
+                  raise Exception(error_message)
+
+          
+
+  # EventBridge Rule to Trigger Lambda2 on Batch Job Completion
+  EventBridgeRuleForBedrockCompletion:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-bedrock-completion'
+      EventPattern:
+        source:
+          - "aws.bedrock"
+        detail-type:
+          - "Batch Inference Job State Change"
+        detail:
+          status:
+            - "Completed"
+          batchJobName:
+            - prefix: "product-analysis-"
+      Targets:
+        - Arn: !GetAtt Lambda2Function.Arn
+          Id: "Lambda2Target"
+
+  # Lambda Permission for EventBridge
+  Lambda2Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt Lambda2Function.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt EventBridgeRuleForBedrockCompletion.Arn
+
+  # S3 Notification Configuration
+  S3NotificationCustomResource:
+    Type: Custom::S3LambdaNotification
+    DependsOn:
+      - ProductInputBucket
+      - Lambda1Function
+      - S3NotificationHelperFunction
+      - Lambda1Permission
+    Properties:
+      ServiceToken: !GetAtt S3NotificationHelperFunction.Arn
+      BucketName: !Ref ProductInputBucket
+      NotificationConfiguration:
+        LambdaFunctionConfigurations:
+          - Events: ['s3:ObjectCreated:*']
+            LambdaFunctionArn: !GetAtt Lambda1Function.Arn
+            Filter:
+              Key:
+                FilterRules:
+                  - Name: "suffix"
+                    Value: ".csv"

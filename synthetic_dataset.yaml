@@ -1,0 +1,408 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for synthetic product data generation'
+
+Parameters:
+  BatchSize:
+    Type: Number
+    Description: Number of products to generate per batch
+    Default: 100
+
+  NumberOfBatches:
+    Type: Number
+    Description: Number of batches to generate
+    Default: 1
+
+Resources:
+
+  # Lambda execution role for main function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${ProductDataBucket}
+                  - !Sub arn:aws:s3:::${ProductDataBucket}/*
+
+    # S3 Bucket for storing generated data
+  ProductDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-products'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+  
+  ProductDataBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref ProductDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LambdaAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - s3:ListBucket
+              - s3:GetObject
+              - s3:PutObject
+            Resource:
+              - !Sub 'arn:aws:s3:::${ProductDataBucket}'
+              - !Sub 'arn:aws:s3:::${ProductDataBucket}/*'
+
+  # Main Lambda function
+  ProductGenerationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import io
+          from datetime import datetime
+          import os
+          import csv
+          import uuid
+          import logging
+          from botocore.config import Config
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def invoke_bedrock_model1(bedrock_client, prompt,model_id,max_tokens=4096, temperature=0, top_p=0.9):
+              response = ""
+              try:
+                  response = bedrock_client.converse(
+                      modelId=model_id,
+                      messages=[
+                          {
+                              "role": "user",
+                              "content": [
+                                  {
+                                      "text": prompt
+                                  } 
+                              ]
+                          }
+                              
+                      ],
+                      inferenceConfig={
+                          "temperature": temperature,
+                          "maxTokens": max_tokens,
+                          "topP": top_p
+                      }
+                      #additionalModelRequestFields={
+                      #}
+                  )
+              except Exception as e:
+                  print(e)
+                  result = "Model invocation error"
+              try:
+                  res=response['output']['message']['content'][0]['text']
+                  result = response['output']['message']['content'][0]['text'] \
+                  + '\n--- Latency: ' + str(response['metrics']['latencyMs']) \
+                  + 'ms - Input tokens:' + str(response['usage']['inputTokens']) \
+                  + ' - Output tokens:' + str(response['usage']['outputTokens']) + ' ---\n'
+                  #data=res.split(":", 1)
+                  #data.to_csv('file1.csv')
+                  return res
+              except Exception as e:
+                  print(e)
+                  result = "Output parsing error"
+              return result
+
+          def generate_nova_image(model_id, prompt, width=1024, height=1024, seed=None):
+              bedrock = boto3.client(
+                  service_name='bedrock-runtime',
+                  config=Config(read_timeout=300)
+              )
+
+              body = json.dumps({
+                  "taskType": "TEXT_IMAGE",
+                  "textToImageParams": {
+                      "text": prompt
+                  },
+                  "imageGenerationConfig": {
+                      "numberOfImages": 1,
+                      "height": height,
+                      "width": width,
+                      "cfgScale": 8.0,
+                      "seed": seed if seed is not None else 0
+                  }
+              })
+
+              response = bedrock.invoke_model(
+                  body=body, 
+                  modelId=model_id, 
+                  accept="application/json", 
+                  contentType="application/json"
+              )
+              response_body = json.loads(response.get("body").read())
+              return base64.b64decode(response_body.get("images")[0].encode('ascii'))
+
+          def generate_products(bucket_name, batch_size):
+              bedrock = boto3.client('bedrock-runtime')
+              text_model_id = "amazon.nova-pro-v1:0"
+              image_model_id = 'amazon.nova-canvas-v1:0'
+
+              categories = [
+                  "Dresses", "Tops & Blouses", "Pants & Trousers", "Skirts",
+                  "Activewear", "Sweaters & Cardigans", "Jackets & Coats",
+                  "Jumpsuits & Rompers", "Formal Wear", "Swimwear"
+              ]
+
+              bulk_prompt = f"""Generate {batch_size} unique women's clothing products with the following format for each:
+              Product Name: [creative name]
+              Category: [category from the list]
+              Description: [detailed description including style, material, and features]
+              ---"""
+
+              #generated_text = invoke_bedrock_model1(bedrock, bulk_prompt, text_model_id)
+              generated_text = invoke_bedrock_model1(
+                  bedrock_client=bedrock,
+                  prompt=bulk_prompt,
+                  model_id=text_model_id,
+                  max_tokens=4096,
+                  temperature=0.9
+              )
+
+              products = []
+              
+              timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+              csv_filename = f"products_{timestamp}.csv"
+              
+              s3 = boto3.client('s3')
+              csv_buffer = io.StringIO()
+              writer = csv.DictWriter(csv_buffer, 
+                  fieldnames=['productid', 'productname', 'category', 'productdescription', 'producturl', 'image_path'])
+              writer.writeheader()
+
+              raw_products = generated_text.split('---')
+              for product_text in raw_products:
+                  if not product_text.strip():
+                      continue
+
+                  try:
+                      lines = product_text.strip().split('\n')
+                      product_data = {}
+                      
+                      for line in lines:
+                          if 'Product Name:' in line:
+                              product_data['name'] = line.split(':', 1)[1].strip()
+                          elif 'Category:' in line:
+                              product_data['category'] = line.split(':', 1)[1].strip()
+                          elif 'Description:' in line:
+                              product_data['description'] = line.split(':', 1)[1].strip()
+
+                      if not all(k in product_data for k in ['name', 'category', 'description']):
+                          continue
+
+                      product_id = str(uuid.uuid4())
+                      image_prompt = f"""Professional fashion photography of:
+                      {product_data['name']}
+                      A {product_data['category']} with these details: {product_data['description']}
+                      Style: High-end retail product photography, clean white background, professional lighting"""
+
+                      image_bytes = generate_nova_image(
+                          model_id=image_model_id,
+                          prompt=image_prompt,
+                          width=1024,
+                          height=1024,
+                          seed=uuid.uuid4().int % 1000000
+                      )
+
+                      image_filename = f"images/{product_id}.png"
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key=image_filename,
+                          Body=image_bytes,
+                          ContentType='image/png'
+                      )
+
+                      writer.writerow({
+                          'productid': product_id,
+                          'productname': product_data['name'],
+                          'category': product_data['category'],
+                          'productdescription': product_data['description'],
+                          'producturl': f"https://example.com/products/{product_id}",
+                          'image_path': image_filename
+                      })
+                      products.append(product_id)
+
+                  except Exception as e:
+                      logger.error(f"Error processing product: {str(e)}")
+                      continue
+
+              s3.put_object(
+                  Bucket=bucket_name,
+                  Key=f"csvs/{csv_filename}",
+                  Body=csv_buffer.getvalue(),
+                  ContentType='text/csv'
+              )
+
+              return {
+                  'csv_path': f"csvs/{csv_filename}",
+                  'product_count': len(products)
+              }
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Received event: {json.dumps(event)}")  # Log incoming event
+                  
+                  bucket_name = os.environ['BUCKET_NAME']
+                  batch_size = int(event.get('batch_size', 5))
+                  
+                  logger.info(f"Starting generate_products with batch_size: {batch_size}")
+                  
+                  result = generate_products(bucket_name, batch_size)
+                  
+                  logger.info(f"Generation complete. Result: {json.dumps(result)}")
+                  
+                  response = {
+                      'statusCode': 200,
+                      'count': event.get('count', 0),
+                      'batch_size': batch_size,
+                      'csv_path': result['csv_path'],
+                      'products_generated': result['product_count']
+                  }
+                  
+                  logger.info(f"Returning response: {json.dumps(response)}")
+                  return response
+                  
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  #logger.error(f"Stack trace: {traceback.format_exc()}")  # Add import traceback at the top
+                  return {
+                      'statusCode': 500,
+                      'count': event.get('count', 0),
+                      'error': str(e)
+                  }
+
+
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ProductDataBucket
+
+
+  # Step Function to orchestrate multiple batches
+  ProductGenerationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      DefinitionString: !Sub |
+        {
+        "StartAt": "InitializeCounter",
+        "States": {
+          "InitializeCounter": {
+            "Type": "Pass",
+            "Parameters": {
+              "count": 0,
+              "batch_size.$": "$.batch_size"
+            },
+            "Next": "CheckBatchCount"
+          },
+          "CheckBatchCount": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.count",
+                "NumericEquals": 1,
+                "Next": "FinishExecution"
+              }
+            ],
+            "Default": "GenerateProducts"
+          },
+          "GenerateProducts": {
+            "Type": "Task",
+            "Resource": "${ProductGenerationFunction.Arn}",
+            "Parameters": {
+              "batch_size.$": "$.batch_size",
+              "count.$": "$.count"
+            },
+            "ResultPath": "$.taskResult",
+            "Next": "IncrementCounter"
+          },
+          "IncrementCounter": {
+            "Type": "Pass",
+            "Parameters": {
+              "count.$": "States.MathAdd($.count, 1)",
+              "batch_size.$": "$.batch_size",
+              "taskResult.$": "$.taskResult"
+            },
+            "Next": "CheckBatchCount"
+          },
+          "FinishExecution": {
+            "Type": "Pass",
+            "End": true
+          }
+        }
+        }
+      
+
+  # Step Function execution role
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ProductGenerationFunction.Arn
+
+Outputs:
+  BucketName:
+    Description: Name of the S3 bucket containing generated products
+    Value: !Ref ProductDataBucket
+
+  StateMachineArn:
+    Description: ARN of the Step Function state machine
+    Value: !Ref ProductGenerationStateMachine
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt ProductGenerationFunction.Arn
